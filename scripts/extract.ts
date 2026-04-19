@@ -99,7 +99,25 @@ interface MemoryBlock {
   longTermBackground: string[];
 }
 
+// Normalize content before parsing: lowercase headers, strip extra #
+function normalizeMemory(content: string): string {
+  return content
+    // Normalize header levels (### or #### -> ##)
+    .replace(/^#{3,}\s*/gm, "## ")
+    // Normalize whitespace around headers
+    .replace(/^##\s+/gm, "## ")
+    // Lowercase header text for matching
+    .replace(/^## [A-Z]/gm, (m) => m.toLowerCase())
+    // Strip trailing whitespace
+    .replace(/[ \t]+$/gm, "")
+    // Normalize multiple blank lines to double
+    .replace(/\n{3,}/g, "\n\n");
+}
+
 function parseMemory(content: string): MemoryBlock {
+  // Normalize first
+  const normalized = normalizeMemory(content);
+  
   const sections: MemoryBlock = {
     workContext: "",
     personalContext: "",
@@ -109,21 +127,33 @@ function parseMemory(content: string): MemoryBlock {
     longTermBackground: [],
   };
 
-  const workMatch = content.match(/## Work context\n([\s\S]*?)(?=\n## |$)/);
-  const personalMatch = content.match(/## Personal context\n([\s\S]*?)(?=\n## |$)/);
-  const topMatch = content.match(/## Top of mind\n([\s\S]*?)(?=\n## |$)/);
-  const briefMatch = content.match(/## Brief history\n([\s\S]*?)(?=\n## |$)/);
-  const earlierMatch = content.match(/## Earlier context\n([\s\S]*?)(?=\n## |$)/);
-  const longMatch = content.match(/## Long-term background\n([\s\S]*?)(?=\n## |$)/);
+  const workMatch = normalized.match(/## work context\n([\s\S]*?)(?=\n## |$)/i);
+  const personalMatch = normalized.match(/## personal context\n([\s\S]*?)(?=\n## |$)/i);
+  const topMatch = normalized.match(/## top of mind\n([\s\S]*?)(?=\n## |$)/i);
+  const briefMatch = normalized.match(/## brief history\n([\s\S]*?)(?=\n## |$)/i);
+  const earlierMatch = normalized.match(/## earlier context\n([\s\S]*?)(?=\n## |$)/i);
+  const longMatch = normalized.match(/## long[- ]?term background\n([\s\S]*?)(?=\n## |$)/i);
 
   if (workMatch) sections.workContext = workMatch[1].trim();
   if (personalMatch) sections.personalContext = personalMatch[1].trim();
-  if (topMatch) sections.topOfMind = topMatch[1].split("\n").filter(l => l.trim()).map(l => l.replace(/^-\s*/, ""));
+  if (topMatch) sections.topOfMind = topMatch[1].split("\n").filter(l => l.trim()).map(l => l.replace(/^[-*]\s*/, ""));
   if (briefMatch) sections.briefHistory = briefMatch[1].split("\n\n").filter(l => l.trim());
   if (earlierMatch) sections.earlierContext = earlierMatch[1].split("\n\n").filter(l => l.trim());
-  if (longMatch) sections.longTermBackground = longMatch[1].split("\n").filter(l => l.trim()).map(l => l.replace(/^-\s*/, ""));
+  if (longMatch) sections.longTermBackground = longMatch[1].split("\n").filter(l => l.trim()).map(l => l.replace(/^[-*]\s*/, ""));
 
   return sections;
+}
+
+function validateMemory(block: MemoryBlock): { valid: boolean; missing: string[] } {
+  const missing: string[] = [];
+  
+  if (!block.workContext.trim()) missing.push("work context");
+  if (!block.personalContext.trim()) missing.push("personal context");
+  if (block.topOfMind.length === 0) missing.push("top of mind");
+  if (block.briefHistory.length === 0) missing.push("brief history");
+  if (block.longTermBackground.length === 0) missing.push("long-term background");
+  
+  return { valid: missing.length === 0, missing };
 }
 
 function formatMemory(block: MemoryBlock): string {
@@ -136,7 +166,7 @@ function formatMemory(block: MemoryBlock): string {
   return output;
 }
 
-async function callLLM(prompt: string): Promise<string> {
+async function callLLM(prompt: string, maxTokens: number = 3000): Promise<string> {
   const response = await fetch(`${BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
@@ -147,7 +177,7 @@ async function callLLM(prompt: string): Promise<string> {
       model: MODEL,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.3,
-      max_tokens: 3000,
+      max_tokens: maxTokens,
     }),
   });
 
@@ -237,7 +267,7 @@ OUTPUT:`;
     return parseMemory(result);
   }
 
-  // STEP 3: Merge with existing memory
+  // STEP 3: Merge with existing memory (use 12k tokens for large merges)
   const existingStr = formatMemory(existingMemory);
 
   const mergePrompt = `Merge the new facts into the existing memory and output the result.
@@ -264,7 +294,7 @@ RULES:
 
 Output the complete merged memory starting with "## Work context":`;
 
-  const mergedResult = await callLLM(mergePrompt);
+  const mergedResult = await callLLM(mergePrompt, 12000);
   return parseMemory(mergedResult);
 }
 
@@ -312,8 +342,35 @@ async function main() {
   console.error(`Extracting memory using ${MODEL}...`);
   console.error(`Endpoint: ${BASE_URL}`);
 
-  // Extract and compress
-  const updatedMemory = await extractMemory(conversationText, existingMemory);
+  // Extract and compress with validation loop (max 3 retries)
+  let updatedMemory: MemoryBlock | null = null;
+  const MAX_RETRIES = 3;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    updatedMemory = await extractMemory(conversationText, existingMemory);
+    
+    const validation = validateMemory(updatedMemory);
+    
+    if (validation.valid) {
+      console.error(`Validation passed on attempt ${attempt}`);
+      break;
+    }
+    
+    console.error(`Validation failed on attempt ${attempt}: missing sections: ${validation.missing.join(", ")}`);
+    
+    if (attempt < MAX_RETRIES) {
+      console.error("Retrying...");
+    } else {
+      console.error("Max retries reached. Aborting to prevent memory corruption.");
+      console.error("The LLM returned malformed output and could not produce valid memory.");
+      process.exit(1);
+    }
+  }
+
+  if (!updatedMemory) {
+    console.error("Error: No memory produced.");
+    process.exit(1);
+  }
 
   // Format output
   const output = formatMemory(updatedMemory);
