@@ -24,6 +24,7 @@ import { homedir } from "node:os";
 const DEFAULT_API_KEY = process.env.OPENAI_API_KEY || "";
 const DEFAULT_BASE_URL = process.env.OPENAI_BASE_URL || "https://integrate.api.nvidia.com/v1";
 const DEFAULT_MODEL = process.env.OPENAI_MODEL || "nvidia/nemotron-3-super-120b-a12b";
+const DEFAULT_MAX_CHARS = 50000; // Max characters before truncation
 
 // Parse CLI arguments
 const { values } = parseArgs({
@@ -36,6 +37,7 @@ const { values } = parseArgs({
     "api-key": { type: "string", default: "" },
     "base-url": { type: "string", default: "" },
     model: { type: "string", default: "" },
+    "max-chars": { type: "string", default: String(DEFAULT_MAX_CHARS) },
     help: { type: "boolean", short: "h", default: false },
   },
   allowPositional: true,
@@ -77,6 +79,16 @@ EXAMPLES:
 const API_KEY = values["api-key"] || process.env.OPENAI_API_KEY || DEFAULT_API_KEY;
 const BASE_URL = values["base-url"] || process.env.OPENAI_BASE_URL || DEFAULT_BASE_URL;
 const MODEL = values.model || process.env.OPENAI_MODEL || DEFAULT_MODEL;
+const MAX_CHARS = parseInt(values["max-chars"] || String(DEFAULT_MAX_CHARS));
+
+// Truncate conversation if too large
+function truncateConversation(text: string): string {
+  if (text.length <= MAX_CHARS) return text;
+  
+  console.error(`Truncating conversation from ${text.length} to ${MAX_CHARS} chars...`);
+  const truncated = text.slice(-MAX_CHARS);
+  return "[...conversation truncated to last portion...]\n\n" + truncated;
+}
 
 interface MemoryBlock {
   workContext: string;
@@ -135,7 +147,7 @@ async function callLLM(prompt: string): Promise<string> {
       model: MODEL,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.3,
-      max_tokens: 2000,
+      max_tokens: 3000,
     }),
   });
 
@@ -149,48 +161,111 @@ async function callLLM(prompt: string): Promise<string> {
 }
 
 async function extractMemory(conversationText: string, existingMemory: MemoryBlock): Promise<MemoryBlock> {
-  const existingStr = existingMemory.workContext ? formatMemory(existingMemory) : "No existing memory.";
+  const hasExisting = existingMemory.workContext.length > 0;
 
-  const prompt = `You are a memory extraction system. Extract and compress information from the conversation below into a structured memory block.
+  // STEP 1: Extract new facts from conversation only
+  const extractionPrompt = `Extract facts from this conversation. Output ONLY new information, nothing from existing memory.
 
-OUTPUT FORMAT (exact structure required):
-## Work context
-<1-2 sentences with dense nouns describing current project/work identity>
+OUTPUT FORMAT:
+## New facts
+- <fact 1>
+- <fact 2>
+...
 
-## Personal context
-<2-3 sentences about communication style, preferences, no examples>
+## New top of mind
+- <new active concern>
+...
 
-## Top of mind
-- <bullet point for active decisions, open questions, blocking issues>
-- <max 5 bullets, only what matters NOW>
-
-## Brief history
-<paragraphs describing recent work, grouped by theme, specific outcomes>
-
-## Earlier context
-<paragraphs describing past phases, compressed, thematic>
-
-## Long-term background
-- <one-liner per persistent trait or background interest>
+## Resolved items
+- <items that should be removed from top of mind because they're completed>
+...
 
 RULES:
-1. Dense noun phrases, no conversational filler
-2. No "the user said" or "we discussed" - pure extracted facts
-3. New info supersedes old, remove duplicates
-4. Group by theme, not chronology
-5. Be specific: names, URLs, decisions, outcomes
-6. Compress: brief history stays detailed, earlier context compresses further
+1. Only extract NEW facts not already known
+2. Be specific: names, URLs, decisions, outcomes
+3. Dense noun phrases, no conversational filler
+4. No "the user said" - pure extracted facts
 
-EXISTING MEMORY:
-${existingStr}
-
-CONVERSATION TO EXTRACT FROM:
+CONVERSATION:
 ${conversationText}
 
 OUTPUT:`;
 
-  const result = await callLLM(prompt);
-  return parseMemory(result);
+  const newFactsRaw = await callLLM(extractionPrompt);
+
+  // Parse new facts
+  const newFactsMatch = newFactsRaw.match(/## New facts\n([\s\S]*?)(?=\n## |$)/);
+  const newTopMatch = newFactsRaw.match(/## New top of mind\n([\s\S]*?)(?=\n## |$)/);
+  const resolvedMatch = newFactsRaw.match(/## Resolved items\n([\s\S]*?)(?=\n## |$)/);
+
+  const newFacts = newFactsMatch ? newFactsMatch[1].split("\n").filter(l => l.trim().startsWith("-")).map(l => l.replace(/^-\s*/, "")) : [];
+  const newTopOfMind = newTopMatch ? newTopMatch[1].split("\n").filter(l => l.trim().startsWith("-")).map(l => l.replace(/^-\s*/, "")) : [];
+  const resolvedItems = resolvedMatch ? resolvedMatch[1].split("\n").filter(l => l.trim().startsWith("-")).map(l => l.replace(/^-\s*/, "")) : [];
+
+  // STEP 2: If no existing memory, create new
+  if (!hasExisting) {
+    const createPrompt = `Create a memory block from these extracted facts.
+
+OUTPUT FORMAT (exact structure):
+## Work context
+<1-2 sentences with dense nouns describing project/work identity>
+
+## Personal context
+<2-3 sentences about communication style, preferences>
+
+## Top of mind
+- <bullet for active decisions, open questions>
+- <max 5 bullets>
+
+## Brief history
+<paragraphs describing recent work, grouped by theme>
+
+## Earlier context
+<past phases, compressed, thematic>
+
+## Long-term background
+- <one-liner per persistent trait or background interest>
+
+NEW FACTS:
+${newFacts.join("\n")}
+
+${newTopOfMind.length > 0 ? "NEW TOP OF MIND:\n" + newTopOfMind.join("\n") : ""}
+
+OUTPUT:`;
+
+    const result = await callLLM(createPrompt);
+    return parseMemory(result);
+  }
+
+  // STEP 3: Merge with existing memory
+  const existingStr = formatMemory(existingMemory);
+
+  const mergePrompt = `Merge the new facts into the existing memory and output the result.
+
+EXISTING MEMORY:
+${existingStr}
+
+NEW FACTS TO ADD:
+${newFacts.length > 0 ? newFacts.map(f => `- ${f}`).join("\n") : "(none)"}
+
+NEW TOP OF MIND ITEMS:
+${newTopOfMind.length > 0 ? newTopOfMind.map(i => `- ${i}`).join("\n") : "(none)"}
+
+RESOLVED (REMOVE FROM TOP OF MIND):
+${resolvedItems.length > 0 ? resolvedItems.map(i => `- ${i}`).join("\n") : "(none)"}
+
+RULES:
+- Work context: COMBINE if multiple active projects (list both), REPLACE if same project
+- Personal context: PRESERVE existing, ADD new preferences only
+- Top of mind: Keep max 5 items, remove resolved, add new important ones
+- Brief history: Move OLD brief history to Earlier context, put NEW facts as new Brief history
+- Earlier context: Compress and group by theme
+- Long-term background: Keep all existing, add new traits only if truly new
+
+Output the complete merged memory starting with "## Work context":`;
+
+  const mergedResult = await callLLM(mergePrompt);
+  return parseMemory(mergedResult);
 }
 
 async function fetchUrl(url: string): Promise<string> {
@@ -215,6 +290,9 @@ async function main() {
     console.error("Error: No conversation provided. Use -c, -t, or -u.");
     process.exit(1);
   }
+
+  // Truncate if too large
+  conversationText = truncateConversation(conversationText);
 
   // Read existing memory if it exists
   let existingMemory: MemoryBlock = {
