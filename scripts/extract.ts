@@ -194,27 +194,31 @@ async function extractMemory(conversationText: string, existingMemory: MemoryBlo
   const hasExisting = existingMemory.workContext.length > 0;
 
   // STEP 1: Extract new facts from conversation only
-  const extractionPrompt = `Extract facts from this conversation. Output ONLY new information, nothing from existing memory.
+  const extractionPrompt = `Extract ONLY NEW facts from this conversation that are NOT already in existing memory.
+
+EXISTING MEMORY (do NOT repeat these facts):
+${hasExisting ? formatMemory(existingMemory) : "(no existing memory)"}
 
 OUTPUT FORMAT:
 ## New facts
-- <fact 1>
+- <fact 1 - ONLY facts not already in existing memory>
 - <fact 2>
 ...
 
 ## New top of mind
-- <new active concern>
+- <new active concern not already tracked>
 ...
 
 ## Resolved items
-- <items that should be removed from top of mind because they're completed>
+- <items to remove from top of mind>
 ...
 
 RULES:
-1. Only extract NEW facts not already known
-2. Be specific: names, URLs, decisions, outcomes
-3. Dense noun phrases, no conversational filler
-4. No "the user said" - pure extracted facts
+1. DO NOT extract facts already in existing memory - check carefully
+2. Only extract genuinely NEW information
+3. Be specific: names, URLs, decisions, outcomes
+4. Dense noun phrases, no conversational filler
+5. If all facts are already known, output "## New facts\n(none)"
 
 CONVERSATION:
 ${conversationText}
@@ -284,13 +288,20 @@ ${newTopOfMind.length > 0 ? newTopOfMind.map(i => `- ${i}`).join("\n") : "(none)
 RESOLVED (REMOVE FROM TOP OF MIND):
 ${resolvedItems.length > 0 ? resolvedItems.map(i => `- ${i}`).join("\n") : "(none)"}
 
-RULES:
+MERGE RULES:
 - Work context: COMBINE if multiple active projects (list both), REPLACE if same project
 - Personal context: PRESERVE existing, ADD new preferences only
 - Top of mind: Keep max 5 items, remove resolved, add new important ones
 - Brief history: Move OLD brief history to Earlier context, put NEW facts as new Brief history
 - Earlier context: Compress and group by theme
 - Long-term background: Keep all existing, add new traits only if truly new
+
+DEDUPLICATION RULES (CRITICAL):
+- Check ALL sections for duplicate or semantically overlapping facts
+- If a fact appears in both existing AND new: keep the MORE DETAILED version, discard the other
+- If a fact in Brief history overlaps with Earlier context: keep in Brief only if it has NEW information, otherwise discard
+- Remove near-duplicates (same fact phrased differently)
+- Do NOT let the same facts accumulate across multiple paragraphs in Brief history
 
 Output the complete merged memory starting with "## Work context":`;
 
